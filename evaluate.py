@@ -1,5 +1,4 @@
-"""COCO mask AP of a detections json against a COCO annotation file.
-Reports AP[.25:.95] (mean over IoU 0.25:0.05:0.95), AP50, AP70, AP75 and AP[.50:.95]."""
+"""Mask AP[.25:.95], AP50 and AP70 of a detections json against a COCO annotation file."""
 import argparse
 import json
 import os
@@ -26,8 +25,6 @@ def main():
     print(f"AP[.25:.95] {m['AP_25_95'] * 100:.2f}")
     print(f"AP50        {m['AP50'] * 100:.2f}")
     print(f"AP70        {m['AP70'] * 100:.2f}")
-
-
 
 
 if __name__ == '__main__':

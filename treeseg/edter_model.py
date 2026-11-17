@@ -1,17 +1,4 @@
-"""Standalone PyTorch port of EDTER (Pu et al., CVPR 2022), no mmcv/mmseg needed.
-
-Faithful to the official repo (EDTER/mmseg/models/...):
-  Stage I  (global): ViT-L/16 + BiMLA decoder + BIMLA head + 8 auxiliary heads.
-  Stage II (local) : ViT-B/8 on non-overlapping 160x160 windows + BiMLA (1x1) +
-                     BIMLA head (x8 up) + SFT fusion with frozen Stage-I features.
-Module/parameter names are kept identical so pretrained ViT weights load the same way.
-
-Addition for instance segmentation (not in the original paper): a small *extent*
-(tree-crown foreground) branch on top of the Stage-I 128-ch global features, since
-edges alone cannot tell closed background regions from closed crown regions.
-All heads return LOGITS (sigmoid is applied in the loss / at inference) which is
-mathematically identical to the original sigmoid+BCE but safe under AMP.
-"""
+"""EDTER (Pu et al., CVPR 2022) in plain PyTorch, with an extra crown-extent head on Stage I."""
 import math
 from functools import partial
 
@@ -61,7 +48,6 @@ class Attention(nn.Module):
     def forward(self, x):
         B, N, C = x.shape
         q, k, v = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        # same math as softmax(q k^T * d^-0.5) v, using the fused SDPA kernel
         x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop if self.training else 0.)
         x = x.transpose(1, 2).reshape(B, N, C)
         return self.proj_drop(self.proj(x))
@@ -100,7 +86,7 @@ def _cbr(cin, cout, k):
 
 
 class Conv_BIMLA(nn.Module):
-    """Bidirectional multi-level aggregation. local=True -> 1x1 convs (Stage II variant)."""
+    """Bidirectional multi-level aggregation."""
 
     def __init__(self, in_channels=1024, mla_channels=256, local=False):
         super().__init__()
@@ -159,36 +145,6 @@ class VIT_BIMLA(nn.Module):
         trunc_normal_(self.pos_embed)
         trunc_normal_(self.cls_token)
 
-    def init_weights(self, pretrained_path):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                trunc_normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.constant_(m.bias, 0)
-                nn.init.constant_(m.weight, 1.0)
-        if pretrained_path.endswith('.safetensors'):
-            from safetensors.torch import load_file
-            sd = load_file(pretrained_path)
-        else:
-            sd = torch.load(pretrained_path, map_location='cpu')
-        for k in ('head.weight', 'head.bias'):
-            sd.pop(k, None)
-        if self.local:  # official load_pretrained_local drops the 16x16 patch embedding (local uses 8x8 patches)
-            sd.pop('patch_embed.proj.weight')
-            sd.pop('patch_embed.proj.bias')
-        # pos_embed interpolation (pos_embed_interp=True, align_corners=False)
-        pe = sd['pos_embed']
-        cls_pe, grid = pe[:, :1], pe[:, 1:]
-        n, hw, c = grid.shape
-        h = int(math.sqrt(hw))
-        grid = grid.transpose(1, 2).reshape(n, c, h, h)
-        grid = F.interpolate(grid, size=int(math.sqrt(self.num_patches)), mode='bilinear', align_corners=False)
-        sd['pos_embed'] = torch.cat([cls_pe, grid.reshape(n, c, -1).transpose(1, 2)], 1)
-        missing, unexpected = self.load_state_dict(sd, strict=False)
-        print(f'[VIT_BIMLA local={self.local}] loaded {pretrained_path}; missing={len(missing)} unexpected={unexpected}')
-
     def forward(self, x):
         B = x.shape[0]
         x = self.patch_embed(x).flatten(2).transpose(1, 2)
@@ -203,7 +159,6 @@ class VIT_BIMLA(nn.Module):
 
 
 def _up(cin, cout, factor):
-    # x2 then x8 (global, total x16) or x2 then x4 (local, total x8), exactly as in the official heads
     k2, s2, p2 = (16, 8, 4) if factor == 16 else (8, 4, 2)
     return nn.Sequential(nn.ConvTranspose2d(cin, cout, 4, stride=2, padding=1, bias=False), nn.BatchNorm2d(cout), nn.ReLU(),
                          nn.ConvTranspose2d(cout, cout, k2, stride=s2, padding=p2, bias=False), nn.BatchNorm2d(cout), nn.ReLU())
@@ -229,7 +184,7 @@ def _feat_stack(c):
 
 
 class VIT_BIMLAHead(nn.Module):
-    """Stage-I decode head (+ optional extent branch)."""
+    """Stage I decode head with extent branch."""
 
     def __init__(self, mla_channels=256, mlahead_channels=128, with_extent=True):
         super().__init__()
@@ -263,14 +218,12 @@ class VIT_BIMLA_AUXIHead(nn.Module):
 class EDTERGlobal(nn.Module):
     """EDTER Stage I."""
 
-    def __init__(self, img_size=320, pretrained=None, with_extent=True):
+    def __init__(self, img_size=320, with_extent=True):
         super().__init__()
         self.backbone = VIT_BIMLA(img_size=img_size, patch_size=16, embed_dim=1024, depth=24, num_heads=16, drop_rate=0.,
                                   mla_channels=256, mla_index=(5, 11, 17, 23))
         self.decode_head = VIT_BIMLAHead(256, 128, with_extent)
         self.auxiliary_head = nn.ModuleList([VIT_BIMLA_AUXIHead(256, i, 16) for i in range(8)])
-        if pretrained:
-            self.backbone.init_weights(pretrained)
 
     def forward(self, img, with_aux=True):
         feats = self.backbone(img)
@@ -325,10 +278,9 @@ class VIT_BIMLAHead_LOCAL8x8(nn.Module):
 
 
 class EDTERLocal(nn.Module):
-    """EDTER Stage II: local ViT-B/8 over non-overlapping 160x160 windows of a 320x320 input,
-    fused (SFT) with the frozen Stage-I global features."""
+    """EDTER Stage II (local ViT-B/8 on 160x160 windows, fused with Stage I features)."""
 
-    def __init__(self, global_model, win=160, pretrained=None):
+    def __init__(self, global_model, win=160):
         super().__init__()
         self.global_model = global_model
         for p in self.global_model.parameters():
@@ -339,22 +291,14 @@ class EDTERLocal(nn.Module):
         self.decode_head = VIT_BIMLAHead_LOCAL8x8(256, 128)
         self.auxiliary_head = nn.ModuleList([VIT_BIMLA_AUXIHead(256, i, 8) for i in range(8)])
         self.fuse_head = Local8x8_fuse_head(128)
-        if pretrained:
-            self.backbone.init_weights(pretrained)
-
-    def train(self, mode=True):
-        super().train(mode)
-        self.global_model.eval()  # global model stays frozen in eval mode (BN statistics fixed)
-        return self
 
     def local_feats(self, img):
-        """Run the local ViT on non-overlapping win x win windows and stitch the 8 BiMLA maps (1/8 res)."""
         B, _, H, W = img.shape
         w = self.win
         nh, nw = H // w, W // w
         assert nh * w == H and nw * w == W
         tiles = img.reshape(B, 3, nh, w, nw, w).permute(0, 2, 4, 1, 3, 5).reshape(B * nh * nw, 3, w, w)
-        feats = self.backbone(tiles)  # each (B*nh*nw, 256, w/8, w/8)
+        feats = self.backbone(tiles)
         out = []
         for f in feats:
             c, s = f.shape[1], f.shape[2]
@@ -370,17 +314,3 @@ class EDTERLocal(nn.Module):
         aux = [h(feats) for h in self.auxiliary_head] if with_aux else []
         fuse_edge, _ = self.fuse_head(lfeat, global_features)
         return dict(edge=edge, aux=aux, fuse_edge=fuse_edge)
-
-
-def hed_loss(logits, target):
-    """Official EDTER/HED class-balanced BCE, summed over pixels and over the batch.
-    logits: (B,1,H,W) raw scores; target: (B,1,H,W) in {0,1}."""
-    logits = logits.float()
-    if logits.shape[-2:] != target.shape[-2:]:
-        logits = F.interpolate(logits, size=target.shape[-2:], mode='bilinear', align_corners=False)
-    pos = (target > 0.5).float()
-    n = pos[0].numel()
-    num_pos = pos.flatten(1).sum(1).view(-1, 1, 1, 1)
-    num_neg = n - num_pos
-    w = torch.where(pos > 0, num_neg / n, num_pos / n)
-    return F.binary_cross_entropy_with_logits(logits, target.float(), weight=w, reduction='sum')

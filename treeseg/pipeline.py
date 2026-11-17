@@ -1,16 +1,17 @@
-"""Inference helpers: over-segmentation graphs and candidate regions at several merge levels."""
+import cv2
 import numpy as np
+from pycocotools import mask as M
 from scipy import ndimage as ndi
 
 import gcn_merge as G
-from hierarchy import region_feats
+
+K3 = np.ones((3, 3), np.uint8)
 
 
 def build_graphs(stems, split, maps_dir, p, net, pool, edge_feats, chunk=48):
-    """Over-segmentation region graphs (node / edge features + LPIPS) for every image."""
     gs = []
     for k in range(0, len(stems), chunk):
-        part = pool.starmap(G.build_graph, [(s, split, maps_dir, p, False) for s in stems[k:k + chunk]])
+        part = pool.starmap(G.build_graph, [(s, split, maps_dir, p) for s in stems[k:k + chunk]])
         G.add_lpips(part, net, 'cuda')
         gs += part
     for g in gs:
@@ -18,9 +19,26 @@ def build_graphs(stems, split, maps_dir, p, net, pool, edge_feats, chunk=48):
     return gs
 
 
+def region_feats(m, edge, ext, fg, sl, level, H, W, n_parts):
+    a = m.sum()
+    md = cv2.dilate(m.astype(np.uint8), K3, iterations=2).astype(bool)
+    ring = md & ~m
+    me = cv2.erode(m.astype(np.uint8), K3, iterations=2).astype(bool)
+    inn = me if me.any() else m
+    e_in = edge[inn]; e_ring = edge[ring] if ring.any() else np.array([0.])
+    x_in = ext[m]
+    cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    hull = cv2.convexHull(np.concatenate(cnts)) if cnts else None
+    ha = cv2.contourArea(hull) if hull is not None else a
+    h, w = m.shape
+    border = float(sl[0].start == 0 or sl[1].start == 0 or sl[0].stop == H or sl[1].stop == W)
+    ring_bg = (~fg[ring]).mean() if ring.any() else 0.
+    return [np.log(a), x_in.mean(), np.quantile(x_in, 0.1), e_in.mean(), e_ring.mean(), np.quantile(e_ring, 0.1), ring_bg,
+            a / max(ha, 1), a / (h * w), max(h, w) / max(min(h, w), 1), border, level, n_parts,
+            e_ring.mean() - e_in.mean(), np.sqrt(a)]
+
+
 def graph_feats(g, prob, root, level):
-    """Per merged region (keyed by its root id): merge level, number of over-segmentation parts, merge probability
-    of the internal edges and of the boundary edges to neighbouring regions."""
     n = len(root)
     parts = np.bincount(root, minlength=n)
     ri, rj = root[g['ei']], root[g['ej']]
@@ -39,7 +57,6 @@ def graph_feats(g, prob, root, level):
 
 
 def regions(lab, edge, ext, p, gf, pad=3):
-    """Regions of a label map -> list of dict(feats, mask (cropped, map grid), box, img_hw)."""
     H, W = lab.shape
     fg = ext > p['t_ext']
     out = []
@@ -59,12 +76,11 @@ def regions(lab, edge, ext, p, gf, pad=3):
 
 
 def candidates_job(args):
-    """Candidate regions of one image: GCN merging at every level in `levels`, duplicates removed."""
     g, prob, levels, p = args
     out, seen = [], set()
     for lv in levels:
         if len(g['ei']):
-            root = G.merge_labels(g, prob, lv, return_root=True)
+            root = G.merge_labels(g, prob, lv)
             lab = root[g['lab']]
             gf = graph_feats(g, prob, root, lv)
         else:
@@ -75,3 +91,38 @@ def candidates_job(args):
             if key not in seen:
                 seen.add(key); r['level'] = lv; out.append(r)
     return g['stem'], out
+
+
+def mask_nms(cands, scores, thr, max_det=100, min_score=0.0):
+    order = np.argsort(-scores)
+    keep, rles = [], []
+    for i in order:
+        if scores[i] < min_score or len(keep) >= max_det:
+            break
+        c = cands[i]
+        y0, x0, y1, x1 = c['box']
+        full = np.zeros(c['img_hw'], np.uint8)
+        full[y0:y1, x0:x1] = c['mask']
+        r = M.encode(np.asfortranarray(full))
+        if rles and M.iou([r], rles, [0] * len(rles)).max() > thr:
+            continue
+        keep.append(i); rles.append(r)
+    return keep
+
+
+def to_dets(cands, keep, scores, img_id, out_hw):
+    H, W = out_hw
+    dets = []
+    for i in keep:
+        c = cands[i]
+        h, w = c['img_hw']
+        y0, x0, y1, x1 = c['box']
+        sy, sx = H / h, W / w
+        crop = cv2.resize(c['mask'].astype(np.uint8), (int(round((x1 - x0) * sx)), int(round((y1 - y0) * sy))),
+                          interpolation=cv2.INTER_NEAREST)
+        full = np.zeros((H, W), np.uint8)
+        Y0, X0 = int(round(y0 * sy)), int(round(x0 * sx))
+        full[Y0:Y0 + crop.shape[0], X0:X0 + crop.shape[1]] = crop[:H - Y0, :W - X0]
+        r = M.encode(np.asfortranarray(full)); r['counts'] = r['counts'].decode(); r['size'] = [int(v) for v in r['size']]
+        dets.append(dict(image_id=img_id, category_id=1, segmentation=r, score=float(scores[i])))
+    return dets
