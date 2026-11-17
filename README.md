@@ -10,6 +10,7 @@ Pipeline: EDTER edge / extent maps (Stage I + Stage II, flip + multi-scale TTA) 
 Tree-instance-segmentation/
 ├── predict.py              # images -> detections json
 ├── evaluate.py             # detections json + COCO annotations -> AP
+├── visualize.py            # detections (+ ground truth, edge maps) drawn on the tiles
 ├── requirements.txt
 ├── treeseg/                # model and pipeline code
 └── checkpoints/
@@ -46,7 +47,7 @@ ForestSeg-T1/
 ```
 
 ## Inference
-
+### Please run it first before evaluation
 ```bash
 python predict.py \
     --data_root /path/to/ForestSeg-T1 \
@@ -78,3 +79,29 @@ python evaluate.py \
 ```
 
 Prints mask AP[.25:.95] (mean over IoU thresholds 0.25:0.05:0.95), AP50 and AP70 (COCO evaluation, maxDets 100).
+
+## Visualization
+
+```bash
+python visualize.py \
+    --dets outputs/val_dets.json \
+    --data_root /path/to/ForestSeg-T1 \
+    --split Val \
+    --ann /path/to/ForestSeg-T1/Val/annotations/instances.json \
+    --maps work/Val/maps \
+    --out_dir outputs/vis \
+    --max_images 20
+```
+
+Each output image shows the predicted crowns, and, when given, the ground-truth crowns (`--ann`) and the EDTER edge map (`--maps`) side by side.
+
+| argument | description |
+|---|---|
+| `--dets` | detections json from `predict.py` |
+| `--data_root`, `--split` | image location, as in `predict.py` |
+| `--out_dir` | output folder (one `.jpg` per tile) |
+| `--ann` | optional COCO json, adds a ground-truth panel |
+| `--maps` | optional EDTER maps folder (`<work>/maps` written by `predict.py`), adds an edge-map panel |
+| `--score_thr` | draw only detections with score ≥ this value (default 0) |
+| `--images` | optional list of image file names to draw |
+| `--max_images` | maximum number of tiles to draw (default 20) |
