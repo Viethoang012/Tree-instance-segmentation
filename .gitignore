@@ -1,0 +1,11 @@
+# large model weights (keep locally / distribute separately)
+checkpoints/edter_stage1.pth
+checkpoints/edter_stage2.pth
+checkpoints/torch_hub/
+
+# caches and outputs
+work/
+outputs/
+__pycache__/
+*.pyc
+checkpoints/
