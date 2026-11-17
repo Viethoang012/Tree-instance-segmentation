@@ -45,7 +45,8 @@ ForestSeg-T1/
     ├── images/*.jpg
     └── annotations/instances.json
 ```
-
+## Checkpoint (Updating)
+### Backup at: https://drive.google.com/drive/folders/1MD_eT9HgyZM6tqfdyJl_pTbrQGe7Fc3f?usp=sharing
 ## Inference
 ### Please run it first before evaluation
 ```bash
